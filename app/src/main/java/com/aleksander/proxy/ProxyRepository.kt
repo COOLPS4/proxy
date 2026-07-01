@@ -4,6 +4,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.net.HttpURLConnection
@@ -50,38 +52,51 @@ object ProxyRepository {
     )
 
     private val SOCKS5_SOURCES = listOf(
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt"
     )
 
-    private const val MAX_CANDIDATES = 150
-    private const val CONNECT_TIMEOUT_MS = 2500
+    private const val MAX_CANDIDATES = 600   // how many to pull from the sources
+    private const val POOL_TO_CHECK = 320    // how many to actually TCP-probe
+    private const val CONCURRENCY = 80       // simultaneous probes
+    private const val CONNECT_TIMEOUT_MS = 1800
 
     /**
-     * Returns up to [want] live proxies of the given [type].
-     * If not enough proxies pass the liveness check, the list is topped up
-     * with unverified candidates so the user always gets a full list.
+     * Returns up to [want] LIVE proxies of the given [type], sorted by lowest
+     * ping first. Only proxies that pass a real TCP connection check are
+     * returned — dead entries are never shown.
      */
     suspend fun findWorking(type: ProxyType, want: Int = 10): List<Proxy> = withContext(Dispatchers.IO) {
-        val candidates = fetchCandidates(type).shuffled().take(MAX_CANDIDATES)
-        if (candidates.isEmpty()) return@withContext emptyList()
+        val all = fetchCandidates(type)
+        if (all.isEmpty()) return@withContext emptyList()
 
-        val checked = coroutineScope {
-            candidates.map { p ->
+        // Probe the most promising candidates first: for MTProto the sources
+        // already provide a latency hint, so check the fastest hinted ones.
+        val ordered = when (type) {
+            ProxyType.MTPROTO -> all.sortedWith(compareBy(nullsLast()) { it.latencyMs })
+            ProxyType.SOCKS5 -> all.shuffled()
+        }
+        val pool = ordered.take(POOL_TO_CHECK)
+
+        val gate = Semaphore(CONCURRENCY)
+        val live = coroutineScope {
+            pool.map { p ->
                 async {
-                    val ms = tcpPing(p.host, p.port, CONNECT_TIMEOUT_MS)
-                    if (ms != null) p.copy(latencyMs = ms) else null
+                    gate.withPermit {
+                        val ms = tcpPing(p.host, p.port, CONNECT_TIMEOUT_MS)
+                        if (ms != null) p.copy(latencyMs = ms) else null
+                    }
                 }
             }.awaitAll()
-        }.filterNotNull().sortedBy { it.latencyMs }
+        }.filterNotNull()
 
-        if (checked.size >= want) {
-            checked.take(want)
-        } else {
-            val filler = candidates.filter { c -> checked.none { it.label == c.label } }
-            (checked + filler).take(want)
-        }
+        // Fastest first, deduplicated by address.
+        live.sortedBy { it.latencyMs }
+            .distinctBy { it.label }
+            .take(want)
     }
 
     private fun fetchCandidates(type: ProxyType): List<Proxy> {
@@ -109,8 +124,10 @@ object ProxyRepository {
                     val host = o.optString("host", o.optString("server", ""))
                     val port = o.optInt("port", 0)
                     val secret = o.optString("secret", "")
+                    val hint = o.optDouble("latency_ms", -1.0)
                     if (host.isNotBlank() && port in 1..65535 && secret.isNotBlank()) {
-                        list.add(Proxy(ProxyType.MTPROTO, host, port, secret))
+                        val lat = if (hint > 0) hint.toLong() else null
+                        list.add(Proxy(ProxyType.MTPROTO, host, port, secret, lat))
                     } else {
                         parseTgLink(o.optString("url", ""))?.let { list.add(it) }
                     }
