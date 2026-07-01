@@ -86,7 +86,7 @@ object ProxyRepository {
             pool.map { p ->
                 async {
                     gate.withPermit {
-                        val ms = tcpPing(p.host, p.port, CONNECT_TIMEOUT_MS)
+                        val ms = probe(p, CONNECT_TIMEOUT_MS)
                         if (ms != null) p.copy(latencyMs = ms) else null
                     }
                 }
@@ -184,12 +184,66 @@ object ProxyRepository {
         null
     }
 
-    /** @return round-trip time in ms if the TCP handshake succeeds, else null. */
-    private fun tcpPing(host: String, port: Int, timeoutMs: Int): Long? {
+    /**
+     * Probes a proxy and returns a realistic ping in ms, or null if it is not
+     * usable. DNS is resolved outside the timing so the number reflects the
+     * real network round-trip. The best of two attempts is kept for stability.
+     *
+     * SOCKS5 proxies additionally must pass a real SOCKS5 handshake with the
+     * "no authentication" method, so servers that merely accept a TCP
+     * connection (but aren't a usable open SOCKS5) are rejected.
+     */
+    private fun probe(p: Proxy, timeoutMs: Int): Long? {
+        val addr = try {
+            java.net.InetAddress.getByName(p.host)
+        } catch (_: Exception) {
+            return null
+        }
+        // First probe decides if it is alive; dead proxies aren't retried.
+        val first = singleProbe(p.type, addr, p.port, timeoutMs) ?: return null
+        val second = singleProbe(p.type, addr, p.port, timeoutMs)
+        return if (second != null) minOf(first, second) else first
+    }
+
+    private fun singleProbe(type: ProxyType, addr: java.net.InetAddress, port: Int, timeoutMs: Int): Long? =
+        when (type) {
+            ProxyType.SOCKS5 -> socks5Ping(addr, port, timeoutMs)
+            ProxyType.MTPROTO -> tcpPing(addr, port, timeoutMs)
+        }
+
+    /** Pure TCP connect time to an already-resolved address. */
+    private fun tcpPing(addr: java.net.InetAddress, port: Int, timeoutMs: Int): Long? {
         val start = System.nanoTime()
         return try {
-            Socket().use { s -> s.connect(InetSocketAddress(host, port), timeoutMs) }
+            Socket().use { s -> s.connect(InetSocketAddress(addr, port), timeoutMs) }
             (System.nanoTime() - start) / 1_000_000
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Connects and performs the SOCKS5 greeting. The reported ping is the pure
+     * TCP-connect time (≈ real ping); the handshake only validates that the
+     * server is a working no-auth SOCKS5 proxy.
+     */
+    private fun socks5Ping(addr: java.net.InetAddress, port: Int, timeoutMs: Int): Long? {
+        return try {
+            Socket().use { s ->
+                val start = System.nanoTime()
+                s.connect(InetSocketAddress(addr, port), timeoutMs)
+                val connectMs = (System.nanoTime() - start) / 1_000_000
+                s.soTimeout = timeoutMs
+                // Greeting: version 5, 1 method, 0x00 = no authentication.
+                s.getOutputStream().apply {
+                    write(byteArrayOf(0x05, 0x01, 0x00))
+                    flush()
+                }
+                val resp = ByteArray(2)
+                val n = s.getInputStream().read(resp)
+                // Valid + usable without a password: 0x05, 0x00.
+                if (n >= 2 && resp[0].toInt() == 0x05 && resp[1].toInt() == 0x00) connectMs else null
+            }
         } catch (_: Exception) {
             null
         }
