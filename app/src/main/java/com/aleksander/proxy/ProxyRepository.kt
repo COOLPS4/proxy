@@ -200,16 +200,77 @@ object ProxyRepository {
             return null
         }
         // First probe decides if it is alive; dead proxies aren't retried.
-        val first = singleProbe(p.type, addr, p.port, timeoutMs) ?: return null
-        val second = singleProbe(p.type, addr, p.port, timeoutMs)
+        val first = probeOnce(p, addr, timeoutMs) ?: return null
+        val second = probeOnce(p, addr, timeoutMs)
         return if (second != null) minOf(first, second) else first
     }
 
-    private fun singleProbe(type: ProxyType, addr: java.net.InetAddress, port: Int, timeoutMs: Int): Long? =
-        when (type) {
-            ProxyType.SOCKS5 -> socks5Ping(addr, port, timeoutMs)
-            ProxyType.MTPROTO -> tcpPing(addr, port, timeoutMs)
+    private fun probeOnce(p: Proxy, addr: java.net.InetAddress, timeoutMs: Int): Long? =
+        when (p.type) {
+            ProxyType.SOCKS5 -> socks5Ping(addr, p.port, timeoutMs)
+            ProxyType.MTPROTO -> mtprotoPing(addr, p.port, p.secret, timeoutMs)
         }
+
+    /**
+     * Validates an MTProto proxy. Modern proxies use a FakeTLS secret (starts
+     * with "ee") and impersonate a real HTTPS site whose domain is embedded in
+     * the secret. We complete a TLS handshake to that domain — only a genuine
+     * FakeTLS proxy answers correctly, which rejects dead/non-MTProto hosts
+     * that merely keep port 443 open. Older "dd"/plain secrets fall back to a
+     * TCP check. The reported ping is the pure TCP-connect time.
+     */
+    private fun mtprotoPing(addr: java.net.InetAddress, port: Int, secret: String?, timeoutMs: Int): Long? {
+        val sni = secret?.let { sniFromSecret(it) }
+        return if (sni != null) tlsPing(addr, port, sni, timeoutMs) else tcpPing(addr, port, timeoutMs)
+    }
+
+    /** Decodes the SNI host hidden in a FakeTLS ("ee…") secret, or null. */
+    private fun sniFromSecret(secret: String): String? {
+        val s = secret.lowercase()
+        if (!s.startsWith("ee")) return null
+        val hex = s.substring(2)
+        if (hex.length <= 32) return null
+        val hostHex = hex.substring(32)
+        return try {
+            val bytes = ByteArray(hostHex.length / 2) {
+                hostHex.substring(it * 2, it * 2 + 2).toInt(16).toByte()
+            }
+            String(bytes, Charsets.US_ASCII)
+                .takeIf { it.length in 3..255 && it.all { c -> c.code in 33..126 } && it.contains('.') }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** TLS-only trust manager: we only care that a TLS handshake completes. */
+    private val sslFactory: javax.net.ssl.SSLSocketFactory by lazy {
+        val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : javax.net.ssl.X509TrustManager {
+            override fun checkClientTrusted(c: Array<java.security.cert.X509Certificate>?, a: String?) {}
+            override fun checkServerTrusted(c: Array<java.security.cert.X509Certificate>?, a: String?) {}
+            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+        })
+        javax.net.ssl.SSLContext.getInstance("TLS")
+            .apply { init(null, trustAll, java.security.SecureRandom()) }
+            .socketFactory
+    }
+
+    private fun tlsPing(addr: java.net.InetAddress, port: Int, sni: String, timeoutMs: Int): Long? {
+        return try {
+            val raw = Socket()
+            val start = System.nanoTime()
+            raw.connect(InetSocketAddress(addr, port), timeoutMs)
+            val connectMs = (System.nanoTime() - start) / 1_000_000
+            val ssl = sslFactory.createSocket(raw, sni, port, true) as javax.net.ssl.SSLSocket
+            ssl.soTimeout = timeoutMs
+            ssl.sslParameters = ssl.sslParameters.apply {
+                serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+            }
+            ssl.use { it.startHandshake() }
+            connectMs
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     /** Pure TCP connect time to an already-resolved address. */
     private fun tcpPing(addr: java.net.InetAddress, port: Int, timeoutMs: Int): Long? {
